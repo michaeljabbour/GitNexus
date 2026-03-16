@@ -1,4 +1,10 @@
 {
+  "rewrites": [
+    {
+      "source": "/api/anthropic/:path*",
+      "destination": "/api/anthropic"
+    }
+  ],
   "headers": [
     {
       "source": "/(.*)",

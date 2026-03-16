@@ -39,6 +39,7 @@ export {
   createGraphRAGAgent,
   streamAgentResponse,
   invokeAgent,
+  verifyApiConnection,
   BASE_SYSTEM_PROMPT,
   type AgentMessage,
 } from './agent';

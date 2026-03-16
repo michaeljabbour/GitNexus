@@ -12,9 +12,13 @@ declare module '@ladybugdb/wasm-core' {
     close(): Promise<void>;
   }
   export interface QueryResult {
-    getAll(): Promise<any[]>;
-    hasNext(): Promise<boolean>;
+    getAllRows(): Promise<any[]>;
+    getAllObjects(): Promise<any[]>;
+    getColumnNames(): Promise<string[]>;
+    hasNext(): boolean;
     getNext(): Promise<any>;
+    getNumTuples(): Promise<number>;
+    close(): Promise<void>;
   }
   export interface PreparedStatement {
     isSuccess(): boolean;

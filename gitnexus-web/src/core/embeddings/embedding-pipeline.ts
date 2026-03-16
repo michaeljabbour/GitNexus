@@ -99,38 +99,58 @@ const batchInsertEmbeddings = async (
 };
 
 /**
- * Create the vector index for semantic search
- * Now indexes the separate CodeEmbedding table
+ * In-memory embedding cache for brute-force semantic search.
+ * LadybugDB WASM does not support the VECTOR extension, so we load all
+ * embeddings into memory and compute cosine similarity in JS.
  */
-let vectorExtensionLoaded = false;
+let embeddingCache: Array<{ nodeId: string; embedding: number[] }> | null = null;
 
+/**
+ * Build the in-memory embedding index.
+ * Loads all CodeEmbedding rows into memory for brute-force cosine search.
+ */
 const createVectorIndex = async (
   executeQuery: (cypher: string) => Promise<any[]>
 ): Promise<void> => {
-  // LadybugDB v0.15+ requires explicit VECTOR extension loading (once per session)
-  if (!vectorExtensionLoaded) {
-    try {
-      await executeQuery('INSTALL VECTOR');
-      await executeQuery('LOAD EXTENSION VECTOR');
-      vectorExtensionLoaded = true;
-    } catch {
-      // Extension may already be loaded — CREATE_VECTOR_INDEX will fail clearly if not
-      vectorExtensionLoaded = true;
-    }
-  }
-
-  const cypher = `
-    CALL CREATE_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx', 'embedding', metric := 'cosine')
-  `;
-
   try {
-    await executeQuery(cypher);
+    const rows = await executeQuery(
+      'MATCH (e:CodeEmbedding) RETURN e.nodeId AS nodeId, e.embedding AS embedding'
+    );
+    embeddingCache = rows
+      .filter(r => {
+        const emb = r.embedding ?? r[1];
+        return Array.isArray(emb) && emb.length > 0;
+      })
+      .map(r => ({
+        nodeId: r.nodeId ?? r[0],
+        embedding: r.embedding ?? r[1],
+      }));
+
+    if (import.meta.env.DEV) {
+      console.log(`📇 In-memory vector index built: ${embeddingCache.length} embeddings`);
+    }
   } catch (error) {
-    // Index might already exist
     if (import.meta.env.DEV) {
       console.warn('Vector index creation warning:', error);
     }
+    embeddingCache = [];
   }
+};
+
+/**
+ * Cosine distance between two vectors (1 - cosine_similarity).
+ * Returns 0 for identical vectors, 2 for opposite.
+ */
+const cosineDistance = (a: number[], b: number[]): number => {
+  let dot = 0, normA = 0, normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  if (denom === 0) return 1;
+  return 1 - dot / denom;
 };
 
 /**
@@ -308,21 +328,19 @@ export const semanticSearch = async (
   // Embed the query
   const queryEmbedding = await embedText(query);
   const queryVec = embeddingToArray(queryEmbedding);
-  const queryVecStr = `[${queryVec.join(',')}]`;
 
-  // Query the vector index on CodeEmbedding to get nodeIds and distances
-  const vectorQuery = `
-    CALL QUERY_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx', 
-      CAST(${queryVecStr} AS FLOAT[384]), ${k})
-    YIELD node AS emb, distance
-    WITH emb, distance
-    WHERE distance < ${maxDistance}
-    RETURN emb.nodeId AS nodeId, distance
-    ORDER BY distance
-  `;
+  // Use in-memory brute-force cosine search (VECTOR extension unavailable in WASM)
+  if (!embeddingCache || embeddingCache.length === 0) {
+    return [];
+  }
 
-  const embResults = await executeQuery(vectorQuery);
-  
+  const scored = embeddingCache.map(entry => ({
+    nodeId: entry.nodeId,
+    distance: cosineDistance(queryVec, entry.embedding),
+  }));
+  scored.sort((a, b) => a.distance - b.distance);
+  const embResults = scored.filter(s => s.distance < maxDistance).slice(0, k);
+
   if (embResults.length === 0) {
     return [];
   }

@@ -11,7 +11,7 @@ import {
 import { isEmbedderReady, disposeEmbedder } from '../core/embeddings/embedder';
 import type { EmbeddingProgress, SemanticSearchResult } from '../core/embeddings/types';
 import type { ProviderConfig, AgentStreamChunk } from '../core/llm/types';
-import { createGraphRAGAgent, streamAgentResponse, type AgentMessage, createChatModel } from '../core/llm/agent';
+import { createGraphRAGAgent, streamAgentResponse, verifyApiConnection, type AgentMessage, createChatModel } from '../core/llm/agent';
 import { SystemMessage } from '@langchain/core/messages';
 import { enrichClustersBatch, ClusterMemberInfo, ClusterEnrichment } from '../core/ingestion/cluster-enricher';
 import { CommunityNode } from '../core/ingestion/community-processor';
@@ -614,6 +614,16 @@ const workerApi = {
       if (import.meta.env.DEV) {
         console.log('🤖 Graph RAG Agent initialized with provider:', config.provider);
       }
+
+      // Fire-and-forget: verify the API key works BEFORE the user tries to chat.
+      // This surfaces auth errors immediately at init time instead of mid-chat.
+      verifyApiConnection(config).then((result) => {
+        if (!result.ok) {
+          console.error('🚨🚨🚨 API KEY PROBLEM 🚨🚨🚨');
+          console.error(result.error);
+          console.error('Chat will NOT work until this is fixed.');
+        }
+      });
 
       return { success: true };
     } catch (error) {

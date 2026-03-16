@@ -272,29 +272,10 @@ export const createGraphRAGTools = (
       try {
         let finalCypher = cypher;
         
-        // Auto-embed if {{QUERY_VECTOR}} placeholder is present
-        if (cypher.includes('{{QUERY_VECTOR}}')) {
-          if (!query) {
-            return "Error: Your Cypher contains {{QUERY_VECTOR}} but you didn't provide a 'query' to embed. Add a natural language query.";
-          }
-          
-          if (!isEmbeddingReady()) {
-            // Try to init embedder
-            try {
-              await initEmbedder();
-            } catch (err) {
-              if (err instanceof WebGPUNotAvailableError) {
-                await initEmbedder(undefined, {}, 'wasm');
-              } else {
-                return 'Embeddings not available. Remove {{QUERY_VECTOR}} and use a non-vector query.';
-              }
-            }
-          }
-          
-          const queryEmbedding = await embedText(query);
-          const queryVec = embeddingToArray(queryEmbedding);
-          const queryVecStr = `CAST([${queryVec.join(',')}] AS FLOAT[384])`;
-          finalCypher = cypher.replace(/\{\{\s*QUERY_VECTOR\s*\}\}/g, queryVecStr);
+        // {{QUERY_VECTOR}} / QUERY_VECTOR_INDEX are NOT available in WASM.
+        // Redirect the agent to use the search tool instead.
+        if (cypher.includes('{{QUERY_VECTOR}}') || cypher.includes('QUERY_VECTOR_INDEX') || cypher.includes('CREATE_VECTOR_INDEX')) {
+          return 'QUERY_VECTOR_INDEX is not available in this environment. Use the "search" tool for semantic queries instead — it combines BM25 and vector search automatically.';
         }
         
         const results = await executeQuery(finalCypher);
@@ -356,10 +337,8 @@ Example queries:
 - All connections (with confidence): MATCH (n)-[r:CodeRelation]-(m) WHERE n.name = 'MyClass' AND r.confidence > 0.8 RETURN m.name, r.type, r.confidence
 - Find fuzzy matches: MATCH (n)-[r:CodeRelation]-(m) WHERE r.confidence < 0.8 RETURN n.name, r.reason
 
-For semantic+graph queries, include {{QUERY_VECTOR}} placeholder and provide a 'query' parameter:
-CALL QUERY_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx', {{QUERY_VECTOR}}, 10) YIELD node AS emb, distance
-WITH emb, distance WHERE distance < 0.5
-MATCH (n:Function {id: emb.nodeId}) RETURN n`,
+For semantic search, use the 'search' tool instead — it combines BM25 and vector search automatically.
+Cypher does NOT support QUERY_VECTOR_INDEX in this environment.`,
       schema: z.object({
         cypher: z.string().describe('The Cypher query to execute'),
         query: z.string().optional().nullable().describe('Natural language query to embed (required if cypher contains {{QUERY_VECTOR}})'),

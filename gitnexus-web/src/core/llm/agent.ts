@@ -140,6 +140,7 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
         maxTokens: openaiConfig.maxTokens,
         configuration: {
           apiKey: openaiConfig.apiKey,
+          dangerouslyAllowBrowser: true,
           ...(openaiConfig.baseUrl ? { baseURL: openaiConfig.baseUrl } : {}),
         },
         streaming: true,
@@ -148,6 +149,11 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
     
     case 'azure-openai': {
       const azureConfig = config as AzureOpenAIConfig;
+
+      if (!azureConfig.apiKey || azureConfig.apiKey.trim() === '') {
+        throw new Error('Azure OpenAI API key is required but was not provided. Go to Settings → Azure OpenAI and enter your key.');
+      }
+
       return new AzureChatOpenAI({
         azureOpenAIApiKey: azureConfig.apiKey,
         azureOpenAIApiInstanceName: extractInstanceName(azureConfig.endpoint),
@@ -155,11 +161,19 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
         azureOpenAIApiVersion: azureConfig.apiVersion ?? '2024-12-01-preview',
         // Note: gpt-5.2-chat only supports temperature=1 (default)
         streaming: true,
+        configuration: {
+          dangerouslyAllowBrowser: true,
+        },
       });
     }
     
     case 'gemini': {
       const geminiConfig = config as GeminiConfig;
+
+      if (!geminiConfig.apiKey || geminiConfig.apiKey.trim() === '') {
+        throw new Error('Google Gemini API key is required but was not provided. Go to Settings → Gemini and enter your key.');
+      }
+
       return new ChatGoogleGenerativeAI({
         apiKey: geminiConfig.apiKey,
         model: geminiConfig.model,
@@ -171,12 +185,32 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
     
     case 'anthropic': {
       const anthropicConfig = config as AnthropicConfig;
+
+      if (!anthropicConfig.apiKey || anthropicConfig.apiKey.trim() === '') {
+        throw new Error('Anthropic API key is required but was not provided. Go to Settings → Anthropic and enter your key.');
+      }
+
+      if (import.meta.env.DEV) {
+        const k = anthropicConfig.apiKey;
+        console.log(
+          `🔑 [Anthropic] key=${k.slice(0, 10)}…${k.slice(-4)} model=${anthropicConfig.model}`
+        );
+      }
+
       return new ChatAnthropic({
         anthropicApiKey: anthropicConfig.apiKey,
         model: anthropicConfig.model,
         temperature: anthropicConfig.temperature ?? 0.1,
         maxTokens: anthropicConfig.maxTokens ?? 8192,
         streaming: true,
+        // Route through Vite proxy to avoid COEP blocking cross-origin fetch to api.anthropic.com
+        anthropicApiUrl: `${typeof self !== 'undefined' && self.location ? self.location.origin : ''}/api/anthropic`,
+        // Kill retries — 401s should fail immediately, not retry 6 times silently
+        maxRetries: 0,
+        clientOptions: {
+          dangerouslyAllowBrowser: true,
+          maxRetries: 0,
+        },
       });
     }
     
@@ -221,6 +255,7 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
         configuration: {
           apiKey: openRouterConfig.apiKey, // Ensure client receives it
           baseURL: openRouterConfig.baseUrl ?? 'https://openrouter.ai/api/v1',
+          dangerouslyAllowBrowser: true,
         },
         streaming: true,
       });
@@ -341,6 +376,17 @@ export async function* streamAgentResponse(
     // Anything before the first tool call should be treated as "reasoning/narration"
     // so the UI can show the Cursor-like loop: plan → tool → update → tool → answer.
     let hasSeenToolCallThisTurn = false;
+    // Track if messages-mode already delivered text content so we don't double-emit
+    // from the values-mode fallback handler.
+    // NOTE: createReactAgent uses model.invoke() (non-streaming), so handleLLMNewToken
+    // never fires. handleLLMEnd should emit ONE complete message via 'messages' mode
+    // as a fallback. If even that fails (e.g. handleChatModelStart threw silently
+    // because metadata.langgraph_checkpoint_ns was undefined, or the LLM errored),
+    // we fall through to extract the AI message text directly from the values snapshot.
+    let hasSentStreamingContent = false;
+    // Track which message IDs we've already emitted from the values fallback to
+    // avoid re-emitting the same message across multiple values snapshots.
+    const yieldedValuesMessageIds = new Set<string>();
     
     for await (const event of stream) {
       // Events come as [streamMode, data] tuples when using multiple modes
@@ -362,10 +408,26 @@ export async function* streamAgentResponse(
       
       // DEBUG: Enhanced logging
       if (import.meta.env.DEV) {
-        const msgType = mode === 'messages' && data?.[0]?._getType?.() || 'n/a';
-        const hasContent = mode === 'messages' && data?.[0]?.content;
-        const hasToolCalls = mode === 'messages' && data?.[0]?.tool_calls?.length > 0;
-        console.log(`🔄 [${mode}] type:${msgType} content:${!!hasContent} tools:${hasToolCalls}`);
+        if (mode === 'values' && data?.messages) {
+          // For values events, show the actual state so we can see if LLM responded
+          const msgs: any[] = data.messages ?? [];
+          const newMsgs = msgs.slice(lastProcessedMsgCount);
+          const summary = newMsgs.map((m: any) => {
+            const t = m._getType?.() || m.type || '?';
+            const c = typeof m.content === 'string'
+              ? m.content.slice(0, 80).replace(/\n/g, '↵')
+              : Array.isArray(m.content) ? `[${m.content.length} blocks]` : '';
+            const tc = m.tool_calls?.length ? ` tools:${m.tool_calls.length}` : '';
+            const err = m.content && typeof m.content === 'string' && m.content.includes('Error') ? ' ⚠️' : '';
+            return `${t}:"${c}"${tc}${err}`;
+          }).join(' | ');
+          console.log(`🔄 [values] total:${msgs.length} new:[${summary || 'none'}]`);
+        } else {
+          const msgType = mode === 'messages' && data?.[0]?._getType?.() || 'n/a';
+          const hasContent = mode === 'messages' && data?.[0]?.content;
+          const hasToolCalls = mode === 'messages' && data?.[0]?.tool_calls?.length > 0;
+          console.log(`🔄 [${mode}] type:${msgType} content:${!!hasContent} tools:${!!hasToolCalls}`);
+        }
       }
       // Handle 'messages' mode - token-by-token streaming
       if (mode === 'messages') {
@@ -401,6 +463,7 @@ export async function* streamAgentResponse(
               !hasSeenToolCallThisTurn ||
               toolCalls.length > 0 ||
               !allToolsDone;
+            hasSentStreamingContent = true; // messages-mode delivered content
             yield {
               type: isReasoning ? 'reasoning' : 'content',
               [isReasoning ? 'reasoning' : 'content']: content,
@@ -455,18 +518,62 @@ export async function* streamAgentResponse(
       if (mode === 'values' && data?.messages) {
         const stepMessages = data.messages || [];
         
-        // Process new messages for tool calls/results we might have missed
+        // Process new messages for tool calls/results we might have missed,
+        // AND fall back to extracting AI text content when messages-mode never fired.
+        //
+        // WHY THIS FALLBACK EXISTS:
+        // createReactAgent calls model.invoke() (non-streaming), so handleLLMNewToken
+        // never fires. LangGraph's StreamMessagesHandler.handleLLMEnd() should emit
+        // one complete 'messages' event. But if handleChatModelStart threw silently
+        // (e.g. metadata.langgraph_checkpoint_ns was absent) or the LLM errored,
+        // handleLLMEnd returns early and the response is ONLY in the values snapshot.
+        // Without this fallback, the user would see nothing at all.
         for (let i = lastProcessedMsgCount; i < stepMessages.length; i++) {
           const msg = stepMessages[i];
           const msgType = msg._getType?.() || msg.type || 'unknown';
           
-          // Catch tool calls from values mode (backup)
-          if ((msgType === 'ai' || msgType === 'AIMessage') && !yieldedToolCalls.size) {
+          if (msgType === 'ai' || msgType === 'AIMessage') {
+            // ── FALLBACK: extract text content from AI message ────────────────
+            // Only emit from values mode if messages-mode hasn't already delivered
+            // this content. Use the message ID as the dedup key; fall back to the
+            // loop index stringified so we never re-emit the same snapshot.
+            if (!hasSentStreamingContent) {
+              const msgId: string = msg.id ?? `values-msg-${i}`;
+              if (!yieldedValuesMessageIds.has(msgId)) {
+                yieldedValuesMessageIds.add(msgId);
+
+                const rawContent = msg.content;
+                let textContent = '';
+                if (typeof rawContent === 'string') {
+                  textContent = rawContent;
+                } else if (Array.isArray(rawContent)) {
+                  textContent = rawContent
+                    .filter((b: any) => b.type === 'text' || typeof b === 'string')
+                    .map((b: any) => (typeof b === 'string' ? b : b.text || ''))
+                    .join('');
+                }
+
+                if (textContent.trim()) {
+                  if (import.meta.env.DEV) {
+                    console.log(`📋 [values-fallback] emitting AI text (${textContent.length} chars) — messages-mode never fired`);
+                  }
+                  // Determine reasoning vs final: same heuristic as messages mode
+                  const isReasoning = !hasSeenToolCallThisTurn || !allToolsDone;
+                  yield {
+                    type: isReasoning ? 'reasoning' : 'content',
+                    [isReasoning ? 'reasoning' : 'content']: textContent,
+                  };
+                }
+              }
+            }
+
+            // ── BACKUP: emit tool calls we didn't see in messages mode ────────
             const toolCalls = msg.tool_calls || [];
             for (const tc of toolCalls) {
               const toolId = tc.id || `tool-${Date.now()}`;
               if (!yieldedToolCalls.has(toolId)) {
                 allToolsDone = false;
+                hasSeenToolCallThisTurn = true;
                 yieldedToolCalls.add(toolId);
                 yield {
                   type: 'tool_call',
@@ -512,14 +619,32 @@ export async function* streamAgentResponse(
     }
     yield { type: 'done' };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    // DEBUG: Stream error
-    if (import.meta.env.DEV) {
-      console.error('❌ Stream error:', message, error);
+    const rawMessage = error instanceof Error ? error.message : String(error);
+
+    // Classify the error and provide actionable guidance
+    let userMessage: string;
+    const lower = rawMessage.toLowerCase();
+    if (lower.includes('authentication') || lower.includes('invalid x-api-key') || lower.includes('401')) {
+      userMessage = `Authentication failed — your API key is invalid or expired. Update it in Settings. (${rawMessage})`;
+    } else if (lower.includes('not_found') || lower.includes('404') || lower.includes('does not exist')) {
+      userMessage = `Model not found — the model name in Settings may be wrong. (${rawMessage})`;
+    } else if (lower.includes('rate_limit') || lower.includes('429') || lower.includes('overloaded')) {
+      userMessage = `Rate limited — too many requests or the API is overloaded. Wait a moment and retry. (${rawMessage})`;
+    } else if (lower.includes('insufficient') || lower.includes('billing') || lower.includes('credit')) {
+      userMessage = `Billing issue — check your API account balance / billing settings. (${rawMessage})`;
+    } else {
+      userMessage = rawMessage;
     }
+
+    // Always log loudly so it's visible even in a web worker console
+    console.error('❌ [LLM ERROR]', userMessage);
+    if (import.meta.env.DEV) {
+      console.error('❌ [LLM ERROR detail]', error);
+    }
+
     yield { 
       type: 'error', 
-      error: message,
+      error: userMessage,
     };
   }
 }
@@ -528,6 +653,72 @@ export async function* streamAgentResponse(
  * Get a non-streaming response from the agent
  * Simpler for cases where streaming isn't needed
  */
+/**
+ * Verify the API key works by making a minimal request.
+ * Call at agent init time — surfaces auth errors immediately instead of
+ * letting the user discover them mid-chat when the stream silently hangs.
+ */
+export const verifyApiConnection = async (
+  config: ProviderConfig
+): Promise<{ ok: boolean; error?: string }> => {
+  if (config.provider !== 'anthropic') return { ok: true }; // only anthropic uses proxy
+
+  const anthropicConfig = config as AnthropicConfig;
+  const baseUrl = typeof self !== 'undefined' && self.location
+    ? self.location.origin
+    : '';
+  const url = `${baseUrl}/api/anthropic/v1/messages`;
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': anthropicConfig.apiKey,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify({
+        model: anthropicConfig.model,
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'ping' }],
+      }),
+    });
+
+    if (res.ok) {
+      console.log('✅ [API KEY VERIFIED] Anthropic connection OK');
+      // consume body to avoid connection leak
+      await res.text().catch(() => {});
+      return { ok: true };
+    }
+
+    const body = await res.text().catch(() => '');
+    if (res.status === 401) {
+      const msg = `❌ [INVALID API KEY] Anthropic returned 401. Your key (${anthropicConfig.apiKey.slice(0, 12)}…) is invalid or expired. Update it in Settings → Anthropic.`;
+      console.error(msg);
+      console.error('   Raw response:', body);
+      return { ok: false, error: msg };
+    }
+
+    // 400 = bad model name, but key is valid
+    if (res.status === 400) {
+      if (body.includes('model')) {
+        const msg = `⚠️ [BAD MODEL NAME] Key is valid but model "${anthropicConfig.model}" was rejected. Check Settings → Anthropic → Model.`;
+        console.warn(msg);
+        return { ok: false, error: msg };
+      }
+    }
+
+    // Other errors (429, 500, etc.) — key might be OK
+    console.warn(`⚠️ [API CHECK] Anthropic returned ${res.status}: ${body.slice(0, 200)}`);
+    return { ok: true }; // don't block on transient errors
+  } catch (err) {
+    const msg = `⚠️ [API CHECK] Network error — proxy may not be running: ${err}`;
+    console.warn(msg);
+    return { ok: false, error: msg };
+  }
+};
+
 export const invokeAgent = async (
   agent: ReturnType<typeof createReactAgent>,
   messages: AgentMessage[]

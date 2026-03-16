@@ -56,7 +56,7 @@ export interface GeminiConfig extends BaseProviderConfig {
 export interface AnthropicConfig extends BaseProviderConfig {
   provider: 'anthropic';
   apiKey: string;
-  model: string;  // e.g., 'claude-sonnet-4-20250514', 'claude-3-5-sonnet-20241022'
+  model: string;  // e.g., 'claude-opus-4-6', 'claude-sonnet-4-6'
 }
 
 /**
@@ -110,7 +110,7 @@ export interface LLMSettings {
  * Default LLM settings
  */
 export const DEFAULT_LLM_SETTINGS: LLMSettings = {
-  activeProvider: 'gemini',
+  activeProvider: 'anthropic',
   intelligentClustering: false,
   hasSeenClusteringPrompt: false,
   useSameModelForClustering: true,
@@ -134,7 +134,7 @@ export const DEFAULT_LLM_SETTINGS: LLMSettings = {
   },
   anthropic: {
     apiKey: '',
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-opus-4-6',
     temperature: 0.1,
   },
   ollama: {
@@ -314,14 +314,8 @@ QUERY PATTERNS:
    MATCH (f:File)-[:CodeRelation {type: 'IMPORTS'}]->(target:File {name: 'utils.ts'})
    RETURN f.name, f.filePath
 
-6. SEMANTIC SEARCH (embeddings in separate table - MUST JOIN):
-   CALL QUERY_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx', $queryVector, 10)
-   YIELD node AS emb, distance
-   WITH emb, distance
-   WHERE distance < 0.4
-   MATCH (n:Function {id: emb.nodeId})
-   RETURN n.name, n.filePath, distance
-   ORDER BY distance
+6. SEMANTIC SEARCH: Use the 'search' tool for semantic queries — it combines BM25 and vector search.
+   QUERY_VECTOR_INDEX is NOT available in this environment.
 
 7. Search across all code types (use UNION or separate queries):
    MATCH (f:Function) WHERE f.name CONTAINS 'auth' RETURN f.id, f.name, 'Function' AS type
